@@ -75,6 +75,7 @@ def receive_packets(host: str, port: int, output_file: str = None) -> None:
                     continue
 
                 seq_num = packet.sequence_number
+                                
 
                 # ------------------------------------------------------------
                 # Expected packet received
@@ -149,7 +150,7 @@ def receive_packets(host: str, port: int, output_file: str = None) -> None:
                             "No valid ACK to send yet; "
                             "waiting for packet 0"
                         )
-                print(f"Sent ACK {packet.sequence_number} to {addr}")
+               
 
             elif packet.packet_type == PACKET_TYPE_END:
                 print(f"Received END packet from {addr}")
