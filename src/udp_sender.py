@@ -16,6 +16,7 @@ from packet import Packet, create_start_packet, create_data_packet, create_end_p
 from file_utils import chunk_file, get_file_chunk_count, DEFAULT_CHUNK_SIZE
 MAX_RETRANSMISSIONS = 5
 INITIAL_RTO = 1.0
+DEFAULT_WINDOW_SIZE = 4
 MIN_RTO = 0.1
 MAX_RTO = 5.0
 ALPHA = 0.125   # SRTT smoothing factor (RFC 6298: 1/8)
@@ -40,7 +41,9 @@ def send_message(host: str, port: int, message: str) -> None:
         sock.close()
 
 
-def send_file(host: str, port: int, filepath: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> None:
+def send_file(host: str, port: int, filepath: str, chunk_size: int = DEFAULT_CHUNK_SIZE, window_size: int = DEFAULT_WINDOW_SIZE) -> None:
+    if window_size <= 0:
+        raise ValueError("Window size must be greater than 0")
     """
     Send a file's contents via UDP using packetization.
 
@@ -81,103 +84,166 @@ def send_file(host: str, port: int, filepath: str, chunk_size: int = DEFAULT_CHU
             sock.settimeout(INITIAL_RTO)
 
             # Send DATA packets reliably
-            # RTT/RTO state — persists across all packets in this transfer
+                        # ============================================================
+            # SLIDING WINDOW - GO-BACK-N
+            # ============================================================
+
+            # RTT/RTO state — persists across the whole transfer
             srtt = None
             rttvar = None
             current_rto = INITIAL_RTO
 
             total_retransmissions = 0
-            retransmission_stats = {}   # seq_num -> number of retransmissions for that packet
+            retransmission_stats = {}
+
+            # Create all DATA packets first
+            packets = {}
 
             for seq_num, chunk in enumerate(chunks):
                 packet = create_data_packet(seq_num, chunk)
-                serialized = packet.serialize()
+                packets[seq_num] = packet.serialize()
 
-                retransmissions = 0
-                attempt_rto = current_rto   # starts at the latest smoothed estimate
+            # Go-Back-N variables
+            base = 0
+            next_seq_num = 0
 
-                while True:
-                    send_time = time.time()        # timestamp THIS specific attempt
-                    sock.sendto(serialized, (host, port))
-                    print(
-                        f"Sent DATA packet {seq_num + 1}/{chunk_count} "
-                        f"({len(chunk)} bytes) [rto={attempt_rto:.3f}s]"
+            print(f"Sliding window size: {window_size}")
+
+            while base < chunk_count:
+
+                # --------------------------------------------------------
+                # Send packets while there is space in the window
+                # --------------------------------------------------------
+                while next_seq_num < base + window_size and next_seq_num < chunk_count:
+
+                    sock.sendto(
+                        packets[next_seq_num],
+                        (host, port)
                     )
 
-                    sock.settimeout(attempt_rto)
+                    print(
+                        f"Sent DATA packet {next_seq_num + 1}/{chunk_count} "
+                        f"[window: {base}-{min(base + window_size - 1, chunk_count - 1)}]"
+                    )
 
-                    try:
-                        while True:
-                            ack_data, ack_addr = sock.recvfrom(65535)
-                            ack = Packet.deserialize(ack_data)
+                    next_seq_num += 1
 
-                            if ack is None:
-                                print("Received invalid ACK")
-                                continue
+                # --------------------------------------------------------
+                # Wait for ACK
+                # --------------------------------------------------------
+                sock.settimeout(current_rto)
 
-                            if not ack.verify_integrity()[0]:
-                                print("Received corrupted ACK")
-                                continue
+                try:
 
-                            if ack.packet_type != PACKET_TYPE_ACK:
-                                print("Received non-ACK packet")
-                                continue
+                    while True:
 
-                            if ack.sequence_number != seq_num:
-                                print(f"Ignoring stale/duplicate ACK {ack.sequence_number} "
-                                      f"(expecting {seq_num})")
-                                continue
+                        ack_data, ack_addr = sock.recvfrom(65535)
 
-                            # Correct ACK received
-                            print(f"Received ACK {seq_num}")
+                        ack = Packet.deserialize(ack_data)
 
-                            # --- Karn's Algorithm ---
-                            # Only trust this RTT sample if the packet was NOT retransmitted.
-                            if retransmissions == 0:
-                                sample_rtt = time.time() - send_time
+                        if ack is None:
+                            print("Received invalid ACK")
+                            continue
 
-                                if srtt is None:
-                                    # First ever sample
-                                    srtt = sample_rtt
-                                    rttvar = sample_rtt / 2
-                                else:
-                                    rttvar = (1 - BETA) * rttvar + BETA * abs(srtt - sample_rtt)
-                                    srtt = (1 - ALPHA) * srtt + ALPHA * sample_rtt
+                        if not ack.verify_integrity()[0]:
+                            print("Received corrupted ACK")
+                            continue
 
-                                current_rto = srtt + K * rttvar
-                                current_rto = max(MIN_RTO, min(current_rto, MAX_RTO))
+                        if ack.packet_type != PACKET_TYPE_ACK:
+                            print("Received non-ACK packet")
+                            continue
 
-                                print(f"  RTT sample={sample_rtt*1000:.1f}ms  "
-                                    f"SRTT={srtt*1000:.1f}ms  RTTVAR={rttvar*1000:.1f}ms  "
-                                      f"new RTO={current_rto:.3f}s")
-                            else:
-                                print(f"  (packet was retransmitted {retransmissions}x — "
-                                      f"RTT sample discarded per Karn's Algorithm)")
+                        ack_seq = ack.sequence_number
 
-                            break  # exit the ACK-reading loop
+                        # ACK for a packet already acknowledged
+                        if ack_seq < base:
+                            print(f"Ignoring duplicate ACK {ack_seq}")
+                            continue
 
-                        break  # exit the retry loop — this packet is done
+                        # ACK for a packet currently inside the window
+                        if ack_seq >= base and ack_seq < next_seq_num:
 
-                    except socket.timeout:
+                            print(f"Received ACK {ack_seq}")
+
+                            # ------------------------------------------------
+                            # Slide the window
+                            # ------------------------------------------------
+                            old_base = base
+                            base = ack_seq + 1
+
+                            print(
+                                f"Window moved: "
+                                f"{old_base}-{next_seq_num - 1} "
+                                f"-> {base}-{min(base + window_size - 1, chunk_count - 1)}"
+                            )
+
+                            break
+
+                        else:
+                            print(
+                                f"Ignoring ACK {ack_seq} "
+                                f"(current window: {base}-{next_seq_num - 1})"
+                            )
+
+                except socket.timeout:
+
+                    # ------------------------------------------------------
+                    # TIMEOUT
+                    # Go-Back-N: retransmit every unacknowledged packet
+                    # ------------------------------------------------------
+
+                    print(
+                        f"\nTimeout! No ACK received for window "
+                        f"starting at packet {base}"
+                    )
+
+                    retransmissions = 0
+
+                    # Retransmit all packets currently in the window
+                    for seq_num in range(base, next_seq_num):
+
                         retransmissions += 1
                         total_retransmissions += 1
 
-                        # Karn's Algorithm: back off the timeout exponentially on retry,
-                        # but don't touch the smoothed current_rto estimate
-                        attempt_rto = min(attempt_rto * 2, MAX_RTO)
+                        retransmission_stats[seq_num] = (
+                            retransmission_stats.get(seq_num, 0) + 1
+                        )
 
-                        print(f"Timeout waiting for ACK {seq_num}")
-                        print(f"Retransmitting DATA packet {seq_num} "
-                              f"(attempt {retransmissions}/{MAX_RETRANSMISSIONS}, "
-                              f"next rto={attempt_rto:.3f}s)")
+                        print(
+                            f"Retransmitting DATA packet {seq_num} "
+                            f"(Go-Back-N)"
+                        )
 
-                        if retransmissions >= MAX_RETRANSMISSIONS:
-                            print(f"Maximum retransmissions reached for DATA packet {seq_num}")
-                            raise RuntimeError(
-                                f"Maximum retransmissions reached for packet {seq_num}"
-                                )
+                        sock.sendto(
+                            packets[seq_num],
+                            (host, port)
+                        )
 
-                retransmission_stats[seq_num] = retransmissions
+                    # Exponential timeout backoff
+                    current_rto = min(
+                        current_rto * 2,
+                        MAX_RTO
+                    )
+
+                    print(
+                        f"New RTO after timeout: "
+                        f"{current_rto:.3f}s"
+                    )
+
+                    # Check retransmission limit
+                    if any(
+                        count >= MAX_RETRANSMISSIONS
+                        for count in retransmission_stats.values()
+                    ):
+                        raise RuntimeError(
+                            "Maximum retransmissions reached"
+                        )
+
+            print("\nAll DATA packets acknowledged.")
+
+            # ============================================================
+            # END SLIDING WINDOW
+            # ============================================================
 
             # Send END packet
             end_packet = create_end_packet(chunk_count)
@@ -237,6 +303,12 @@ def main():
         default=DEFAULT_CHUNK_SIZE,
         help=f'Chunk size in bytes (default: {DEFAULT_CHUNK_SIZE})'
     )
+    parser.add_argument(
+    '--window-size',
+    type=int,
+    default=DEFAULT_WINDOW_SIZE,
+    help=f'Sliding window size (default: {DEFAULT_WINDOW_SIZE})'
+    )
     
     # Either message or file must be provided
     group = parser.add_mutually_exclusive_group(required=True)
@@ -254,7 +326,7 @@ def main():
     if args.message:
         send_message(args.host, args.port, args.message)
     elif args.file:
-        send_file(args.host, args.port, args.file, args.chunk_size)
+        send_file(args.host, args.port, args.file, args.chunk_size, args.window_size)
 
 
 if __name__ == '__main__':
